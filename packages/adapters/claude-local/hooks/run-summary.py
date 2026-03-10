@@ -167,11 +167,13 @@ def determine_status(summary: str, git_info: dict[str, str]) -> str:
 
     if "## blocked" in first_line or "blocked" in first_line:
         return "blocked"
-    if git_info.get("uncommitted"):
-        return "in_progress"
     if "## done" in first_line or "done" in first_line:
         return "done"
-    return "in_progress"
+    if "## update" in first_line or "update" in first_line:
+        return "in_progress"
+    # Default to done — the agent session completed, so assume work finished
+    # unless the summary explicitly says blocked or update.
+    return "done"
 
 
 def build_fallback_comment(git_info: dict[str, str]) -> str:
