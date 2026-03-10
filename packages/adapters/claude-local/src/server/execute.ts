@@ -33,6 +33,8 @@ const PAPERCLIP_SKILLS_CANDIDATES = [
   path.resolve(__moduleDir, "../../../../../skills"), // dev: src/server/ -> repo root/skills/
 ];
 
+const RUN_SUMMARY_HOOK = path.resolve(__moduleDir, "../../hooks/run-summary.py");
+
 async function resolvePaperclipSkillsDir(): Promise<string | null> {
   for (const candidate of PAPERCLIP_SKILLS_CANDIDATES) {
     const isDir = await fs.stat(candidate).then((s) => s.isDirectory()).catch(() => false);
@@ -45,22 +47,53 @@ async function resolvePaperclipSkillsDir(): Promise<string | null> {
  * Create a tmpdir with `.claude/skills/` containing symlinks to skills from
  * the repo's `skills/` directory, so `--add-dir` makes Claude Code discover
  * them as proper registered skills.
+ *
+ * Also writes `.claude/settings.json` with a Stop hook that posts a run
+ * summary comment back to the triggering Paperclip issue.
  */
 async function buildSkillsDir(): Promise<string> {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skills-"));
-  const target = path.join(tmp, ".claude", "skills");
+  const claudeDir = path.join(tmp, ".claude");
+  const target = path.join(claudeDir, "skills");
   await fs.mkdir(target, { recursive: true });
   const skillsDir = await resolvePaperclipSkillsDir();
-  if (!skillsDir) return tmp;
-  const entries = await fs.readdir(skillsDir, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isDirectory()) {
-      await fs.symlink(
-        path.join(skillsDir, entry.name),
-        path.join(target, entry.name),
-      );
+  if (skillsDir) {
+    const entries = await fs.readdir(skillsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        await fs.symlink(
+          path.join(skillsDir, entry.name),
+          path.join(target, entry.name),
+        );
+      }
     }
   }
+
+  // Inject Stop hook for automatic run-summary posting
+  const hookExists = await fs.stat(RUN_SUMMARY_HOOK).then(() => true).catch(() => false);
+  if (hookExists) {
+    const settings = {
+      hooks: {
+        Stop: [
+          {
+            matcher: "",
+            hooks: [
+              {
+                type: "command",
+                command: `python3 ${RUN_SUMMARY_HOOK}`,
+                timeout: 90,
+              },
+            ],
+          },
+        ],
+      },
+    };
+    await fs.writeFile(
+      path.join(claudeDir, "settings.json"),
+      JSON.stringify(settings, null, 2),
+    );
+  }
+
   return tmp;
 }
 
