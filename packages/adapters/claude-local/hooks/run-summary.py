@@ -86,6 +86,11 @@ def get_git_info() -> dict[str, str]:
     if diff_stat:
         info["diff_stat"] = diff_stat
 
+    # Actual diff content (capped at 4000 chars for Sonnet context)
+    diff_content = git_cmd("diff", "HEAD~1", "HEAD")
+    if diff_content:
+        info["diff"] = diff_content[:4000]
+
     # Uncommitted changes
     uncommitted = git_cmd("status", "--porcelain")
     if uncommitted:
@@ -96,11 +101,20 @@ def get_git_info() -> dict[str, str]:
     if unpushed:
         info["unpushed"] = unpushed
 
+    # Open PRs from current branch
+    if branch:
+        pr_info = git_cmd("log", "--oneline", "-1", "--format=%s")
+        # Check for PR URL in recent output (gh pr create outputs it)
+        info["head_commit_msg"] = pr_info or ""
+
     return info
 
 
 def call_sonnet(context: str, git_info: dict[str, str]) -> str | None:
     """Call Sonnet to generate a clean issue comment."""
+    has_commits = bool(git_info.get("commits"))
+    has_diff = bool(git_info.get("diff") or git_info.get("diff_stat"))
+
     git_section = ""
     if git_info.get("branch"):
         git_section += f"Branch: {git_info['branch']}\n"
@@ -108,6 +122,8 @@ def call_sonnet(context: str, git_info: dict[str, str]) -> str | None:
         git_section += f"\nRecent commits:\n{git_info['commits']}\n"
     if git_info.get("diff_stat"):
         git_section += f"\nFiles changed (last commit):\n{git_info['diff_stat']}\n"
+    if git_info.get("diff"):
+        git_section += f"\nDiff (last commit, truncated):\n{git_info['diff']}\n"
     if git_info.get("uncommitted"):
         git_section += f"\nUncommitted changes:\n{git_info['uncommitted']}\n"
     if git_info.get("unpushed"):
@@ -115,32 +131,44 @@ def call_sonnet(context: str, git_info: dict[str, str]) -> str | None:
 
     prompt = (
         "You are summarizing what an AI coding agent did during a Paperclip work session. "
-        "Write a concise issue comment in markdown.\n\n"
-        "## Required format\n\n"
-        "```\n"
-        "## Done|Blocked|Update\n\n"
-        "Brief summary of what was accomplished (1-2 sentences).\n\n"
-        "### Changes\n"
+        "Write an issue comment in markdown. Adapt your format to match what was done.\n\n"
+        "## Header\n\n"
+        "Always start with one of:\n"
+        "- `## Done` — work is complete\n"
+        "- `## Blocked` — agent hit a blocker (explain what and who must act)\n"
+        "- `## Update` — work is in progress but not finished\n\n"
+        "Then a 1-2 sentence summary.\n\n"
+        "## Adapt to the work type\n\n"
+        "**If code was committed** (commits exist in git state):\n"
+        "Include a `### Changes` section with:\n"
         "- **Commits**: `abc1234` — short description (list each)\n"
-        "- **Files changed**: key files only\n"
+        "- **Files changed**: key files from the diff stat\n"
+        "- **What changed**: brief description of the actual code changes based on the diff\n"
+        "- **PR**: link if one was created\n"
         "- **Tests**: passed / added N / skipped (why)\n"
-        "- **Deploy**: needed / not needed / already done\n"
-        "```\n\n"
+        "- **Deploy**: needed / not needed\n\n"
+        "**If research, investigation, or information gathering** (no commits):\n"
+        "Include a `### Findings` section with the actual results. "
+        "This is the substantive output — include tables, lists, analysis, "
+        "whatever the agent produced. Don't summarize into nothing. "
+        "If the agent built a table, include the table. If it wrote analysis, "
+        "include the key points. Multiple paragraphs are fine.\n\n"
+        "**If planning or design work** (no commits, plan discussed):\n"
+        "Include a `### Plan` section with the proposed approach.\n\n"
         "## Rules\n"
-        "- Use `## Done` if work is complete.\n"
-        "- Use `## Blocked` if the agent hit a blocker. Explain what and who must act.\n"
-        "- Use `## Update` if work is in progress but not finished.\n"
-        "- Strip ALL internal process: skill evaluations, hook outputs, permission checks, tool calls.\n"
-        "- Focus on OUTCOMES: what was built, fixed, created, deployed.\n"
-        "- If there are uncommitted changes, flag it as a warning.\n"
+        "- Strip ALL internal process: skill evaluations, hook outputs, "
+        "permission checks, tool call JSON, file-reading mechanics.\n"
+        "- Focus on OUTCOMES and SUBSTANCE.\n"
+        "- If there are uncommitted changes, flag as a warning.\n"
         "- If there are unpushed commits, note it.\n"
-        "- Keep it SHORT. Managers read these.\n\n"
+        "- DO NOT pad with boilerplate. No empty sections. "
+        "Only include sections that have real content.\n\n"
     )
 
     if git_section:
         prompt += f"--- GIT STATE ---\n{git_section}--- END GIT ---\n\n"
 
-    prompt += f"--- AGENT SESSION OUTPUT (last 6000 chars) ---\n{context}\n--- END ---"
+    prompt += f"--- AGENT SESSION OUTPUT ---\n{context}\n--- END ---"
 
     try:
         result = subprocess.run(
@@ -176,14 +204,24 @@ def determine_status(summary: str, git_info: dict[str, str]) -> str:
     return "done"
 
 
-def build_fallback_comment(git_info: dict[str, str]) -> str:
+def build_fallback_comment(
+    git_info: dict[str, str], assistant_parts: list[str],
+) -> str:
     """Build a basic comment when Sonnet isn't available."""
-    lines = ["## Update\n", "Agent session completed."]
+    has_commits = bool(git_info.get("commits"))
 
-    if git_info.get("commits"):
+    if has_commits:
+        lines = ["## Done\n", "Agent session completed."]
         lines.append(f"\n### Changes\n- **Commits**:\n```\n{git_info['commits']}\n```")
-    if git_info.get("diff_stat"):
-        lines.append(f"- **Files changed**:\n```\n{git_info['diff_stat']}\n```")
+        if git_info.get("diff_stat"):
+            lines.append(f"- **Files changed**:\n```\n{git_info['diff_stat']}\n```")
+    else:
+        lines = ["## Done\n", "Agent session completed."]
+        if assistant_parts:
+            # Include the last chunk of assistant output as findings
+            last_output = "\n\n".join(assistant_parts)[-3000:]
+            lines.append(f"\n### Findings\n\n{last_output}")
+
     if git_info.get("uncommitted"):
         lines.append(f"\n**Warning**: Uncommitted changes remain:\n```\n{git_info['uncommitted']}\n```")
 
@@ -242,15 +280,15 @@ def main() -> None:
     if not assistant_parts and not git_info:
         return  # Nothing to report
 
-    # Build context for Sonnet (cap at 6000 chars)
+    # Build context for Sonnet (cap at 12000 chars — take from end for recency)
     full_output = "\n\n".join(assistant_parts)
-    context = full_output[-6000:] if len(full_output) > 6000 else full_output
+    context = full_output[-12000:] if len(full_output) > 12000 else full_output
 
     # Generate summary via Sonnet
     summary = call_sonnet(context, git_info)
 
     if not summary:
-        summary = build_fallback_comment(git_info)
+        summary = build_fallback_comment(git_info, assistant_parts)
 
     # Determine status
     status = determine_status(summary, git_info)
