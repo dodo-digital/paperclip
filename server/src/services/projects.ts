@@ -98,6 +98,12 @@ async function attachGoals(db: Db, rows: ProjectRow[]): Promise<ProjectWithGoals
       goals: g,
       agentIds: [] as string[],
       executionWorkspacePolicy: parseProjectExecutionWorkspacePolicy(r.executionWorkspacePolicy),
+      codebase: deriveProjectCodebase({
+        companyId: r.companyId,
+        projectId: r.id,
+        primaryWorkspace: null,
+        fallbackWorkspaces: [],
+      }),
       workspaces: [] as ProjectWorkspace[],
       primaryWorkspace: null,
     } satisfies ProjectWithGoals;
